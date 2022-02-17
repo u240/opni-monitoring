@@ -57,7 +57,7 @@ func WithNamespace(namespace string) EtcdStoreOption {
 }
 
 func NewEtcdStore(conf *v1beta1.EtcdStorageSpec, opts ...EtcdStoreOption) *EtcdStore {
-	options := &EtcdStoreOptions{}
+	options := EtcdStoreOptions{}
 	options.Apply(opts...)
 	lg := logger.New().Named("etcd")
 	var tlsConfig *tls.Config
@@ -82,7 +82,9 @@ func NewEtcdStore(conf *v1beta1.EtcdStorageSpec, opts ...EtcdStoreOption) *EtcdS
 		"endpoints", clientConfig.Endpoints,
 	).Info("connecting to etcd")
 	return &EtcdStore{
-		client: cli,
+		client:           cli,
+		EtcdStoreOptions: options,
+		logger:           lg,
 	}
 }
 

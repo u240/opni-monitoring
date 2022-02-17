@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"text/template"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 	mock_ident "github.com/rancher/opni-monitoring/pkg/test/mock/ident"
 	"github.com/rancher/opni-monitoring/pkg/tokens"
 	"github.com/ttacon/chalk"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"k8s.io/client-go/rest"
@@ -51,6 +53,11 @@ type servicePorts struct {
 	CortexHTTP     int
 }
 
+type RunningAgent struct {
+	*agent.Agent
+	*sync.Mutex
+}
+
 type Environment struct {
 	TestBin string
 	Logger  *zap.SugaredLogger
@@ -62,6 +69,9 @@ type Environment struct {
 	tempDir   string
 	ports     servicePorts
 
+	runningAgents   map[string]RunningAgent
+	runningAgentsMu sync.Mutex
+
 	gatewayConfig *v1beta1.GatewayConfig
 	k8sEnv        *envtest.Environment
 }
@@ -69,6 +79,8 @@ type Environment struct {
 func (e *Environment) Start() error {
 	lg := e.Logger
 	lg.Info("Starting test environment")
+
+	e.runningAgents = make(map[string]RunningAgent)
 
 	e.ctx, e.cancel = context.WithCancel(context.Background())
 	var t gomock.TestReporter
@@ -198,6 +210,9 @@ func (e *Environment) startEtcd() {
 	cmd.Env = []string{"ALLOW_NONE_AUTHENTICATION=yes"}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 	if err := cmd.Start(); err != nil {
 		if !errors.Is(e.ctx.Err(), context.Canceled) {
 			panic(err)
@@ -253,6 +268,9 @@ func (e *Environment) startCortex() {
 	cmd := exec.CommandContext(e.ctx, cortexBin, defaultArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 	if err := cmd.Start(); err != nil {
 		if !errors.Is(e.ctx.Err(), context.Canceled) {
 			panic(err)
@@ -317,6 +335,9 @@ func (e *Environment) StartPrometheus(opniAgentPort int) int {
 	cmd := exec.CommandContext(e.ctx, prometheusBin, defaultArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 	if err := cmd.Start(); err != nil {
 		if !errors.Is(e.ctx.Err(), context.Canceled) {
 			panic(err)
@@ -440,7 +461,30 @@ func (e *Environment) startGateway() {
 	}()
 }
 
-func (e *Environment) StartAgent(id string, token *core.BootstrapToken, pins []string) (int, <-chan error) {
+type StartAgentOptions struct {
+	ctx context.Context
+}
+
+type StartAgentOption func(*StartAgentOptions)
+
+func (o *StartAgentOptions) Apply(opts ...StartAgentOption) {
+	for _, op := range opts {
+		op(o)
+	}
+}
+
+func WithContext(ctx context.Context) StartAgentOption {
+	return func(o *StartAgentOptions) {
+		o.ctx = ctx
+	}
+}
+
+func (e *Environment) StartAgent(id string, token *core.BootstrapToken, pins []string, opts ...StartAgentOption) (int, <-chan error) {
+	options := &StartAgentOptions{
+		ctx: context.Background(),
+	}
+	options.Apply(opts...)
+
 	errC := make(chan error, 1)
 	port, err := freeport.GetFreePort()
 	if err != nil {
@@ -489,7 +533,7 @@ func (e *Environment) StartAgent(id string, token *core.BootstrapToken, pins []s
 		return 0, errC
 	}
 	var a *agent.Agent
-	mu := sync.Mutex{}
+	mu := &sync.Mutex{}
 	go func() {
 		mu.Lock()
 		a, err = agent.New(agentConfig,
@@ -498,11 +542,18 @@ func (e *Environment) StartAgent(id string, token *core.BootstrapToken, pins []s
 				Pins:     publicKeyPins,
 				Endpoint: fmt.Sprintf("http://localhost:%d", e.ports.Gateway),
 			}))
-		mu.Unlock()
 		if err != nil {
 			errC <- err
+			mu.Unlock()
 			return
 		}
+		e.runningAgentsMu.Lock()
+		e.runningAgents[id] = RunningAgent{
+			Agent: a,
+			Mutex: mu,
+		}
+		e.runningAgentsMu.Unlock()
+		mu.Unlock()
 		if err := a.ListenAndServe(); err != nil {
 			errC <- err
 		}
@@ -510,17 +561,29 @@ func (e *Environment) StartAgent(id string, token *core.BootstrapToken, pins []s
 	e.waitGroup.Add(1)
 	go func() {
 		defer e.waitGroup.Done()
-		<-e.ctx.Done()
+		select {
+		case <-e.ctx.Done():
+		case <-options.ctx.Done():
+		}
 		mu.Lock()
 		if a == nil {
 			return
 		}
-		mu.Unlock()
 		if err := a.Shutdown(); err != nil {
 			errC <- err
 		}
+		e.runningAgentsMu.Lock()
+		delete(e.runningAgents, id)
+		e.runningAgentsMu.Unlock()
+		mu.Unlock()
 	}()
 	return port, errC
+}
+
+func (e *Environment) GetAgent(id string) RunningAgent {
+	e.runningAgentsMu.Lock()
+	defer e.runningAgentsMu.Unlock()
+	return e.runningAgents[id]
 }
 
 func (e *Environment) GatewayTLSConfig() *tls.Config {
@@ -533,6 +596,13 @@ func (e *Environment) GatewayTLSConfig() *tls.Config {
 
 func (e *Environment) GatewayConfig() *v1beta1.GatewayConfig {
 	return e.gatewayConfig
+}
+
+func (e *Environment) EtcdClient() (*clientv3.Client, error) {
+	return clientv3.New(clientv3.Config{
+		Endpoints: []string{fmt.Sprintf("http://localhost:%d", e.ports.Etcd)},
+		Context:   e.ctx,
+	})
 }
 
 func StartStandaloneTestEnvironment() {
